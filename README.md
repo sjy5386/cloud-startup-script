@@ -10,15 +10,8 @@ Automates the initial setup of a fresh Ubuntu LTS cloud instance:
 ## Usage
 
 Paste the contents of `bootstrap.sh` into your CSP's user-data field when
-creating the instance. Adjust `USERNAME` or `SSH_PORT` if needed.
-
-```bash
-#!/bin/bash
-set -euo pipefail
-export USERNAME="ubuntu"
-export SSH_PORT="22"
-curl -fsSL https://raw.githubusercontent.com/sjy5386/cloud-startup-script/main/setup.sh | bash
-```
+creating the instance. Adjust `USERNAME` or `SSH_PORT` at the top of the
+script if needed.
 
 After boot, connect as the new user:
 

@@ -4,14 +4,15 @@ Automates the initial setup of a fresh Ubuntu LTS cloud instance:
 
 - Create a sudo user and migrate SSH keys from `/root/.ssh/authorized_keys`
 - Disable root SSH login and password authentication (public-key only)
+- Pin DNS to `1.1.1.1` and `1.0.0.1` (DHCP-provided resolvers are ignored)
 - Install Docker Engine and the Docker Compose plugin
 - Enable `unattended-upgrades` for automatic security patches
 
 ## Usage
 
 Paste the contents of `bootstrap.sh` into your CSP's user-data field when
-creating the instance. Adjust `USERNAME` or `SSH_PORT` at the top of the
-script if needed.
+creating the instance. Adjust `USERNAME`, `SSH_PORT`, or `DNS_SERVERS` at
+the top of the script if needed.
 
 After boot, connect as the new user:
 
@@ -21,10 +22,11 @@ ssh ubuntu@<host>
 
 ## Environment variables
 
-| Name        | Default  | Description                                              |
-|-------------|----------|----------------------------------------------------------|
-| `USERNAME`  | `ubuntu` | Name of the sudo user to create                          |
-| `SSH_PORT`  | `22`     | sshd listen port (sync with your network firewall too)   |
+| Name          | Default           | Description                                             |
+|---------------|-------------------|---------------------------------------------------------|
+| `USERNAME`    | `ubuntu`          | Name of the sudo user to create                         |
+| `SSH_PORT`    | `22`              | sshd listen port (sync with your network firewall too)  |
+| `DNS_SERVERS` | `1.1.1.1 1.0.0.1` | Space-separated IPv4 resolvers. DHCP DNS is not used.  |
 
 ## Supported Ubuntu versions
 
@@ -47,6 +49,9 @@ https://raw.githubusercontent.com/sjy5386/cloud-startup-script/refs/tags/v1.0.0/
 
 ## Troubleshooting
 
+- DNS in use: `resolvectl dns` (expect only `1.1.1.1` and `1.0.0.1`)
+- If setup stops at `name resolution failed`, the instance cannot reach the
+  pinned resolvers on port 53.
 - Execution log: `/var/log/cloud-init-output.log`
 - SSH hardening is the last step, so a failure earlier in the script leaves
   existing root SSH access intact.

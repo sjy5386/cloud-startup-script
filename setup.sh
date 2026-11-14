@@ -1,15 +1,27 @@
 #!/bin/bash
-# Cloud instance bootstrap: sudo user + SSH key migration + root lockdown + Docker.
+# Cloud instance bootstrap: DNS pin + sudo user + SSH key migration + root lockdown + Docker.
 # Designed to be fetched via `curl ... | bash` from CSP user-data.
 
 set -euo pipefail
 
 USERNAME="${USERNAME:-ubuntu}"
 SSH_PORT="${SSH_PORT:-22}"
+# Space-separated IPv4 resolvers. DHCP DNS is ignored once this is applied.
+DNS_SERVERS="${DNS_SERVERS:-1.1.1.1 1.0.0.1}"
 APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Dpkg::Use-Pty=0)
 
 log() { printf '[setup] %s\n' "$*" >&2; }
 err() { printf '[setup][error] %s\n' "$*" >&2; exit 1; }
+
+is_ipv4() {
+  local ip=$1 o
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do
+    [ "$o" -le 255 ] || return 1
+    # Reject leading zeros (08) so the address cannot be read as octal.
+    [ "$o" = "$((10#$o))" ] || return 1
+  done
+}
 
 # 1. Environment validation -------------------------------------------------
 [ "$(id -u)" -eq 0 ] || err "must run as root"
@@ -35,7 +47,210 @@ fi
 
 log "config: USERNAME=$USERNAME SSH_PORT=$SSH_PORT ubuntu=$VERSION_ID"
 
-# 2. System update ----------------------------------------------------------
+# 2. Pin DNS ----------------------------------------------------------------
+# Cloud images take resolvers from DHCP (netplan → systemd-resolved). A
+# resolved drop-in pins the global servers for every lookup (Domains=~.),
+# and a later netplan file stops DHCP from installing its own resolvers.
+# Done before apt so the rest of this script uses the pinned servers.
+read -r -a dns_raw <<< "$DNS_SERVERS"
+declare -A dns_seen=()
+dns_list=()
+for s in "${dns_raw[@]}"; do
+  is_ipv4 "$s" || err "invalid DNS server: $s"
+  [ -n "${dns_seen[$s]:-}" ] && continue
+  dns_seen[$s]=1
+  dns_list+=("$s")
+done
+unset dns_seen
+[ "${#dns_list[@]}" -ge 1 ] || err "DNS_SERVERS is empty"
+
+log "pinning DNS: ${dns_list[*]}"
+
+install -d -m 0755 /etc/systemd/resolved.conf.d
+{
+  echo "# managed by cloud-startup-script"
+  echo "[Resolve]"
+  echo "DNS=${dns_list[*]}"
+  echo "FallbackDNS="
+  echo "Domains=~."
+} >/etc/systemd/resolved.conf.d/dns.conf
+chmod 0644 /etc/systemd/resolved.conf.d/dns.conf
+
+systemctl enable --now systemd-resolved
+systemctl restart systemd-resolved
+
+# A regular file here would bypass systemd-resolved. Ubuntu cloud images
+# already use the stub symlink; only replace a non-symlink.
+if [ ! -L /etc/resolv.conf ]; then
+  log "pointing /etc/resolv.conf at the systemd-resolved stub"
+  ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+fi
+
+# 1 = /etc/netplan/99-dns.yaml was written and `netplan generate` accepted it.
+# `netplan apply` is deferred until package installs finish.
+netplan_dns_ready=0
+
+pin_dns_via_netplan() {
+  command -v python3 >/dev/null || { log "python3 missing; skipping netplan DNS override"; return 0; }
+  command -v netplan >/dev/null || { log "netplan missing; skipping netplan DNS override"; return 0; }
+
+  local dns_csv netplan_rc netplan_ifaces
+  netplan_rc=0
+  netplan_ifaces=""
+  dns_csv=$(IFS=,; printf '%s' "${dns_list[*]}")
+  # python exits 2 when PyYAML is missing, 3 when no netplan devices exist.
+  # The heredoc terminator must be at column 0.
+  netplan_ifaces=$(python3 - "$dns_csv" <<'PY'
+import glob, os, sys
+
+try:
+    import yaml
+except ImportError:
+    sys.exit(2)
+
+servers = [s for s in sys.argv[1].split(",") if s]
+if not servers:
+    sys.exit(1)
+
+# (kind, name) -> [dhcp4, dhcp6]. OR the flags across every file so a later
+# fragment that enables DHCP is not missed.
+found = {}
+order = []
+paths = sorted(glob.glob("/etc/netplan/*.yaml")) + sorted(glob.glob("/etc/netplan/*.yml"))
+for path in paths:
+    if os.path.basename(path) == "99-dns.yaml":
+        continue
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except yaml.YAMLError:
+        sys.exit(1)
+    if not isinstance(data, dict):
+        continue
+    network = data.get("network") or {}
+    if not isinstance(network, dict):
+        continue
+    for kind in ("ethernets", "bonds", "bridges", "vlans"):
+        block = network.get(kind) or {}
+        if not isinstance(block, dict):
+            continue
+        for name, cfg in block.items():
+            key = (kind, name)
+            cfg = cfg if isinstance(cfg, dict) else {}
+            prev = found.get(key, [False, False])
+            found[key] = [
+                prev[0] or cfg.get("dhcp4") is True,
+                prev[1] or cfg.get("dhcp6") is True,
+            ]
+            if key not in order:
+                order.append(key)
+
+if not order:
+    sys.exit(3)
+
+class _NoAliasDumper(yaml.SafeDumper):
+    def ignore_aliases(self, data):
+        return True
+
+network_out = {"version": 2}
+for kind, name in order:
+    dhcp4, dhcp6 = found[(kind, name)]
+    # A fresh list per interface. Reusing one list object makes PyYAML
+    # emit anchors (&id / *id) instead of repeating the addresses.
+    entry = {"nameservers": {"addresses": list(servers)}}
+    # Overrides without the matching dhcp flag make netplan reject the file.
+    if dhcp4:
+        entry["dhcp4-overrides"] = {"use-dns": False}
+    if dhcp6:
+        entry["dhcp6-overrides"] = {"use-dns": False}
+    network_out.setdefault(kind, {})[name] = entry
+
+path = "/etc/netplan/99-dns.yaml"
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write("# managed by cloud-startup-script\n")
+    yaml.dump(
+        {"network": network_out},
+        fh,
+        Dumper=_NoAliasDumper,
+        sort_keys=False,
+        default_flow_style=False,
+    )
+os.chmod(path, 0o600)
+print(" ".join(f"{kind}.{name}" for kind, name in order))
+PY
+) && netplan_rc=0 || netplan_rc=$?
+
+  case "$netplan_rc" in
+    0) ;;
+    2)
+      log "python3-yaml missing; DHCP DNS is not disabled (systemd-resolved still pins global DNS)"
+      return 0
+      ;;
+    3)
+      log "no netplan interfaces found; DHCP DNS is not disabled (systemd-resolved still pins global DNS)"
+      return 0
+      ;;
+    *)
+      err "failed to write /etc/netplan/99-dns.yaml (python exit $netplan_rc)"
+      ;;
+  esac
+
+  log "netplan DNS override for: $netplan_ifaces"
+  # generate only renders backend files under /run. It does not restart the
+  # network, so the curl|bash pipe stays up. apply happens later.
+  if ! netplan generate; then
+    rm -f /etc/netplan/99-dns.yaml
+    if netplan generate >/dev/null 2>&1; then
+      err "netplan generate rejected the DNS override; removed /etc/netplan/99-dns.yaml"
+    fi
+    err "netplan generate failed even without the DNS override"
+  fi
+  netplan_dns_ready=1
+}
+
+global_dns_is_exact() {
+  local line addr
+  local -A want=() seen=()
+  local -a got=()
+  for addr in "${dns_list[@]}"; do
+    want[$addr]=1
+  done
+  line=$(resolvectl dns 2>/dev/null | awk '/^[Gg]lobal:/ {sub(/^[^:]+:[[:space:]]*/, ""); print; exit}')
+  read -r -a got <<< "$line"
+  for addr in "${got[@]}"; do
+    [ -n "$addr" ] || continue
+    seen[$addr]=1
+    [ -n "${want[$addr]:-}" ] || return 1
+  done
+  [ "${#seen[@]}" -eq "${#dns_list[@]}" ] || return 1
+  for addr in "${dns_list[@]}"; do
+    [ -n "${seen[$addr]:-}" ] || return 1
+  done
+}
+
+retry() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    "$@" && return 0
+    sleep 1
+  done
+  return 1
+}
+
+pin_dns_via_netplan
+
+retry global_dns_is_exact \
+  || err "global DNS is not pinned to: ${dns_list[*]} (resolvectl dns: $(resolvectl dns 2>/dev/null | tr '\n' ' '))"
+if command -v timeout >/dev/null; then
+  query_out=$(timeout 15 resolvectl query one.one.one.one 2>&1) \
+    || err "name resolution failed using pinned DNS: $query_out"
+else
+  query_out=$(resolvectl query one.one.one.one 2>&1) \
+    || err "name resolution failed using pinned DNS: $query_out"
+fi
+log "global DNS pinned: $(resolvectl dns 2>/dev/null | awk '/^[Gg]lobal:/ {print; exit}')"
+
+# 3. System update ----------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
 
 log "updating apt indexes"
@@ -47,7 +262,7 @@ apt-get "${APT_OPTS[@]}" -y upgrade
 log "installing prerequisites"
 apt-get "${APT_OPTS[@]}" -y install ca-certificates curl gnupg
 
-# 3. Create sudo user, migrate SSH keys -------------------------------------
+# 4. Create sudo user, migrate SSH keys -------------------------------------
 if id -u "$USERNAME" >/dev/null 2>&1; then
   log "user '$USERNAME' already exists; skipping creation"
 else
@@ -74,7 +289,7 @@ install -m 0600 -o "$USERNAME" -g "$USERNAME" /root/.ssh/authorized_keys "$home_
 grep -qE '^[^#[:space:]]' "$home_ssh/authorized_keys" \
   || err "no SSH keys present in $home_ssh/authorized_keys after copy"
 
-# 4. Docker + Compose plugin ------------------------------------------------
+# 5. Docker + Compose plugin ------------------------------------------------
 log "installing Docker (official apt repo)"
 install -d -m 0755 /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
@@ -91,7 +306,7 @@ apt-get "${APT_OPTS[@]}" -y install \
 usermod -aG docker "$USERNAME"
 systemctl enable --now docker
 
-# 5. Unattended security upgrades -------------------------------------------
+# 6. Unattended security upgrades -------------------------------------------
 log "enabling unattended-upgrades"
 apt-get "${APT_OPTS[@]}" -y install unattended-upgrades
 cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -99,7 +314,62 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
 
-# 6. SSH hardening (LAST — leave root access intact if earlier steps fail) --
+# 7. Apply link DNS (before SSH lockdown) ------------------------------------
+# systemd-resolved already sends lookups to the pinned servers. Applying
+# netplan here clears DHCP resolvers on the interface. Deferred until the
+# package installs finish so a network restart cannot cut off `curl | bash`,
+# and kept before SSH hardening so a failed apply leaves root login intact.
+apply_pinned_dns() {
+  [ "$netplan_dns_ready" -eq 1 ] || return 0
+  log "applying netplan DNS override"
+  if ! netplan apply; then
+    rm -f /etc/netplan/99-dns.yaml
+    netplan generate >/dev/null 2>&1 || true
+    netplan apply || err "netplan apply failed and rollback failed"
+    err "netplan apply failed; rolled back the DNS override"
+  fi
+  systemctl restart systemd-resolved
+}
+
+# Every resolver `resolvectl dns` reports must be one we pinned, and each
+# pinned server must appear. Catches DHCP resolvers that survived netplan.
+dns_is_exact() {
+  local line tok
+  local -a toks=()
+  local -A want=() seen=()
+  for tok in "${dns_list[@]}"; do
+    want[$tok]=1
+  done
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    read -r -a toks <<< "$line" || true
+    for tok in "${toks[@]}"; do
+      tok=${tok%,}
+      tok=${tok%%%*}
+      if [[ "$tok" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+        :
+      elif [[ "$tok" =~ ^[0-9A-Fa-f:]+$ && "$tok" == *:*:* ]]; then
+        :
+      else
+        continue
+      fi
+      seen[$tok]=1
+      [ -n "${want[$tok]:-}" ] || return 1
+    done
+  done < <(resolvectl dns 2>/dev/null || true)
+  for tok in "${dns_list[@]}"; do
+    [ -n "${seen[$tok]:-}" ] || return 1
+  done
+}
+
+apply_pinned_dns
+if [ "$netplan_dns_ready" -eq 1 ]; then
+  retry dns_is_exact \
+    || err "DHCP DNS is still installed (want only: ${dns_list[*]}; resolvectl dns: $(resolvectl dns 2>/dev/null | tr '\n' ' '))"
+  log "link DNS pinned: $(resolvectl dns 2>/dev/null | tr '\n' ' ')"
+fi
+
+# 8. SSH hardening (LAST — leave root access intact if earlier steps fail) --
 log "hardening sshd"
 # sshd keeps the first value of each keyword. Ubuntu's sshd_config starts with
 # `Include /etc/ssh/sshd_config.d/*.conf`, expanded in lexical order, so
@@ -157,9 +427,10 @@ else
   systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 fi
 
-# 7. Done -------------------------------------------------------------------
+# 9. Done -------------------------------------------------------------------
 log "complete"
 log "  user:      $USERNAME (groups: sudo, docker)"
 log "  ssh port:  $SSH_PORT"
+log "  dns:       ${dns_list[*]}"
 log "  connect:   ssh -p $SSH_PORT $USERNAME@<host>"
 log "  root ssh:  disabled"

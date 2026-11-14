@@ -4,6 +4,7 @@
 set -euo pipefail
 export USERNAME="ubuntu"
 export SSH_PORT="22"
+export DNS_SERVERS="1.1.1.1 1.0.0.1"
 export DEBIAN_FRONTEND=noninteractive
 command -v curl >/dev/null || { apt-get update -qq && apt-get install -y -qq curl; }
 curl -fsSL https://raw.githubusercontent.com/sjy5386/cloud-startup-script/main/setup.sh | bash

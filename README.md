@@ -11,8 +11,10 @@ Automates the initial setup of a fresh Ubuntu LTS cloud instance:
 ## Usage
 
 Paste the contents of `bootstrap.sh` into your CSP's user-data field when
-creating the instance. Adjust `USERNAME`, `SSH_PORT`, or `DNS_SERVERS` at
-the top of the script if needed.
+creating the instance. That field is limited to 1024 bytes, so keep
+`bootstrap.sh` within that size. `.githooks/pre-commit` rejects a commit
+that exceeds it. Adjust `USERNAME`, `SSH_PORT`, or `DNS_SERVERS` at the
+top of the script if needed.
 
 `bootstrap.sh` pins those resolvers before it installs `curl` or downloads
 `setup.sh`. `setup.sh` applies the same resolvers again and ignores DHCP DNS.

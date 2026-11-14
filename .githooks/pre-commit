@@ -1,0 +1,13 @@
+#!/bin/bash
+# CSP user-data limit. The staged bootstrap.sh must be at most 1024 bytes.
+set -euo pipefail
+limit=1024
+file=bootstrap.sh
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qx "$file"; then
+  exit 0
+fi
+n=$(git show ":$file" | wc -c | tr -d '[:space:]')
+if [ "$n" -gt "$limit" ]; then
+  printf 'bootstrap.sh is %s bytes (limit %s)\n' "$n" "$limit" >&2
+  exit 1
+fi

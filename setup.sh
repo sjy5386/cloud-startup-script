@@ -51,7 +51,8 @@ log "config: USERNAME=$USERNAME SSH_PORT=$SSH_PORT ubuntu=$VERSION_ID"
 # Cloud images take resolvers from DHCP (netplan → systemd-resolved). A
 # resolved drop-in pins the global servers for every lookup (Domains=~.),
 # and a later netplan file stops DHCP from installing its own resolvers.
-# Done before apt so the rest of this script uses the pinned servers.
+# bootstrap.sh already did this before the download. Repeat it here so a
+# direct run of setup.sh still pins DNS before apt.
 read -r -a dns_raw <<< "$DNS_SERVERS"
 declare -A dns_seen=()
 dns_list=()

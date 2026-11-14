@@ -14,6 +14,9 @@ Paste the contents of `bootstrap.sh` into your CSP's user-data field when
 creating the instance. Adjust `USERNAME`, `SSH_PORT`, or `DNS_SERVERS` at
 the top of the script if needed.
 
+`bootstrap.sh` pins those resolvers before it installs `curl` or downloads
+`setup.sh`. `setup.sh` applies the same resolvers again and ignores DHCP DNS.
+
 After boot, connect as the new user:
 
 ```bash

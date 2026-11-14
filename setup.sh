@@ -101,7 +101,11 @@ EOF
 
 # 6. SSH hardening (LAST — leave root access intact if earlier steps fail) --
 log "hardening sshd"
-sshd_conf="/etc/ssh/sshd_config.d/99-hardening.conf"
+# sshd keeps the first value of each keyword. Ubuntu's sshd_config starts with
+# `Include /etc/ssh/sshd_config.d/*.conf`, expanded in lexical order, so
+# 50-cloud-init.conf (`PasswordAuthentication yes`) beats a later 99- drop-in.
+# 00- is read first and is the value that actually applies.
+sshd_conf="/etc/ssh/sshd_config.d/00-hardening.conf"
 {
   echo "# managed by cloud-startup-script"
   echo "PermitRootLogin no"
@@ -116,6 +120,29 @@ if ! sshd -t; then
   rm -f "$sshd_conf"
   err "sshd config validation failed; reverted hardening conf"
 fi
+
+# sshd -t only checks syntax. Confirm the first-match result is the one we set.
+effective=$(sshd -T) || { rm -f "$sshd_conf"; err "sshd -T failed; reverted hardening conf"; }
+fail=
+for pair in \
+  "passwordauthentication no" \
+  "permitrootlogin no" \
+  "kbdinteractiveauthentication no" \
+  "pubkeyauthentication yes" \
+  "port $SSH_PORT"
+do
+  key=${pair%% *}
+  want=${pair#* }
+  got=$(printf '%s\n' "$effective" | awk -v k="$key" '$1==k {print $2; exit}')
+  if [ "$got" != "$want" ]; then
+    fail+="${key}=${got:-<unset>} (want ${want}); "
+  fi
+done
+if [ -n "$fail" ]; then
+  rm -f "$sshd_conf"
+  err "sshd effective config does not match hardening (${fail% }); reverted"
+fi
+rm -f /etc/ssh/sshd_config.d/99-hardening.conf
 
 if [ "$SSH_PORT" != "22" ]; then
   # Ubuntu 22.10+ ships socket-activated ssh.socket bound to 22 — disable it

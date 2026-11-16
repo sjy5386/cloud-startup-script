@@ -338,10 +338,22 @@ allocate_swapfile() {
   dd if=/dev/zero of="$path" bs=1M count=$((swap_bytes / 1048576)) status=none conv=fsync
 }
 
+# Swapped pages stay readable by anyone who can read the file. swapon only
+# warns about a non-root owner or a mode other than 0600, then activates it.
+# chmod before chown so the file is not left world-readable while still owned
+# by the previous user.
+secure_swapfile() {
+  if [ -L /swapfile ]; then
+    err "/swapfile is a symlink"
+  fi
+  chmod 0600 /swapfile || err "failed to set /swapfile mode to 0600"
+  chown root:root /swapfile || err "failed to set /swapfile owner to root:root"
+}
+
 enable_swapfile() {
   local fstype=$1 mode=$2
   allocate_swapfile /swapfile "$fstype" "$mode" || return 1
-  chmod 0600 /swapfile || return 1
+  secure_swapfile
   mkswap /swapfile >/dev/null || return 1
   swapon /swapfile
 }
@@ -374,12 +386,19 @@ configure_swap() {
 
   human=$(bytes_human "$swap_bytes")
 
+  # -f follows symlinks. chown/chmod would then change the target.
+  if [ -L /swapfile ]; then
+    err "/swapfile is a symlink"
+  fi
   if [ -e /swapfile ] && [ ! -f /swapfile ]; then
     err "/swapfile exists and is not a regular file"
   fi
 
   # Same size and already a swap signature: enable it, do not rewrite.
+  # Fix owner and mode first. An already-active file is included: chmod and
+  # chown work while swapon holds it.
   if [ -f /swapfile ] && [ "$(stat -c%s /swapfile)" -eq "$swap_bytes" ] && swapfile_is_swap; then
+    secure_swapfile
     if swapfile_active || swapon /swapfile; then
       install_swap_fstab
       set_swappiness
@@ -392,7 +411,12 @@ configure_swap() {
   avail_kb=$(df -Pk / | awk 'NR==2 {print $4}') || err "df / failed"
   existing_kb=0
   if [ -f /swapfile ]; then
-    existing_kb=$(( $(stat -c%s /swapfile) / 1024 ))
+    # Unlink returns allocated blocks to df, not the logical size. %s on a
+    # sparse file overstates the space the replacement will reclaim.
+    stat_out=$(stat -c '%b %B' /swapfile) || err "stat /swapfile failed"
+    read -r blocks bsize <<< "$stat_out"
+    [[ "$blocks" =~ ^[0-9]+$ && "$bsize" =~ ^[0-9]+$ ]] || err "stat /swapfile failed"
+    existing_kb=$((blocks * bsize / 1024))
   fi
   # Leave 1 GiB for the package installs that follow this step.
   need_kb=$((swap_bytes / 1024 + 1024 * 1024))

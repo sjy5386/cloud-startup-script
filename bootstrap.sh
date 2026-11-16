@@ -1,7 +1,7 @@
 #!/bin/bash
 # CSP user-data, 1024-byte limit. Downloads setup.sh from main.
 set -euo pipefail
-export USERNAME=ubuntu SSH_PORT=22 DNS_SERVERS='1.1.1.1 1.0.0.1' DEBIAN_FRONTEND=noninteractive
+export USERNAME=ubuntu SSH_PORT=22 DNS_SERVERS='1.1.1.1 1.0.0.1' SWAP_SIZE=2G DEBIAN_FRONTEND=noninteractive
 mkdir -p /etc/systemd/resolved.conf.d
 printf '[Resolve]\nDNS=%s\nFallbackDNS=\nDomains=~.\n' "$DNS_SERVERS" >/etc/systemd/resolved.conf.d/dns.conf
 systemctl restart systemd-resolved

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cloud instance bootstrap: DNS pin + sudo user + SSH key migration + root lockdown + Docker.
+# Cloud instance bootstrap: DNS pin + swap + sudo user + SSH key migration + root lockdown + Docker.
 # Designed to be fetched via `curl ... | bash` from CSP user-data.
 
 set -euo pipefail
@@ -8,6 +8,8 @@ USERNAME="${USERNAME:-ubuntu}"
 SSH_PORT="${SSH_PORT:-22}"
 # Space-separated IPv4 resolvers. DHCP DNS is ignored once this is applied.
 DNS_SERVERS="${DNS_SERVERS:-1.1.1.1 1.0.0.1}"
+# 0 skips. K/M/G are 1024-based (2G, 512M, 2GB). Rounded up to 1 MiB.
+SWAP_SIZE="${SWAP_SIZE:-2G}"
 APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Dpkg::Use-Pty=0)
 
 log() { printf '[setup] %s\n' "$*" >&2; }
@@ -21,6 +23,44 @@ is_ipv4() {
     # Reject leading zeros (08) so the address cannot be read as octal.
     [ "$o" = "$((10#$o))" ] || return 1
   done
+}
+
+# Prints byte count, or 0 when swap is disabled. K/M/G are 1024-based.
+# Rounds up to 1 MiB. Rejects values outside 1 MiB..64 GiB.
+parse_swap_bytes() {
+  local spec=$1 num unit factor bytes
+  case "$spec" in
+    0|off|OFF|none|NONE|false|FALSE|no|NO) echo 0; return 0 ;;
+  esac
+  [[ "$spec" =~ ^([0-9]+)([KkMmGg])?[Bb]?$ ]] || return 1
+  num=${BASH_REMATCH[1]}
+  unit=${BASH_REMATCH[2]:-}
+  case "$unit" in
+    K|k) factor=1024 ;;
+    M|m) factor=$((1024 * 1024)) ;;
+    G|g) factor=$((1024 * 1024 * 1024)) ;;
+    "") factor=1 ;;
+    *) return 1 ;;
+  esac
+  bytes=$((10#$num * factor)) || return 1
+  if [ "$bytes" -eq 0 ]; then
+    echo 0
+    return 0
+  fi
+  [ "$bytes" -ge 1048576 ] || return 1
+  [ "$bytes" -le $((64 * 1024 * 1024 * 1024)) ] || return 1
+  echo $(( (bytes + 1048575) / 1048576 * 1048576 ))
+}
+
+bytes_human() {
+  local b=$1
+  if [ $((b % 1073741824)) -eq 0 ]; then
+    printf '%sG' $((b / 1073741824))
+  elif [ $((b % 1048576)) -eq 0 ]; then
+    printf '%sM' $((b / 1048576))
+  else
+    printf '%sB' "$b"
+  fi
 }
 
 # 1. Environment validation -------------------------------------------------
@@ -40,12 +80,14 @@ esac
 [ "$USERNAME" != "root" ] || err "USERNAME cannot be 'root'"
 { [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ]; } \
   || err "invalid SSH_PORT: $SSH_PORT"
+swap_bytes=$(parse_swap_bytes "$SWAP_SIZE") \
+  || err "invalid SWAP_SIZE: $SWAP_SIZE (examples: 2G, 512M, 0)"
 
 if [ ! -s /root/.ssh/authorized_keys ]; then
   err "/root/.ssh/authorized_keys is empty or missing — refusing to proceed (would lock you out)"
 fi
 
-log "config: USERNAME=$USERNAME SSH_PORT=$SSH_PORT ubuntu=$VERSION_ID"
+log "config: USERNAME=$USERNAME SSH_PORT=$SSH_PORT SWAP_SIZE=$SWAP_SIZE ubuntu=$VERSION_ID"
 
 # 2. Pin DNS ----------------------------------------------------------------
 # Cloud images take resolvers from DHCP (netplan → systemd-resolved). A
@@ -251,7 +293,134 @@ else
 fi
 log "global DNS pinned: $(resolvectl dns 2>/dev/null | awk '/^[Gg]lobal:/ {print; exit}')"
 
-# 3. System update ----------------------------------------------------------
+# 3. Swap file --------------------------------------------------------------
+# Small instances OOM during apt upgrade and the Docker install. Create the
+# file first. A failure here still leaves root SSH open.
+swapfile_active() {
+  awk 'NR>1 && $1=="/swapfile" {found=1} END {exit found?0:1}' /proc/swaps
+}
+
+swapfile_is_swap() {
+  local t
+  t=$(blkid -p -o value -s TYPE /swapfile 2>/dev/null || true)
+  [ "$t" = "swap" ]
+}
+
+# stat %b is 512-byte units. Fewer allocated blocks than the size means holes,
+# which the kernel rejects for a swap file.
+file_has_holes() {
+  local size alloc
+  size=$(stat -c%s "$1") || return 0
+  alloc=$(stat -c%b "$1") || return 0
+  [ $((alloc * 512)) -lt "$size" ]
+}
+
+# Allocate $swap_bytes bytes at $1. fallocate is instant; pass "dd" as $3 to
+# skip it. ext4 and XFS can hand swapon a fallocate file it rejects as having
+# holes, and btrfs swap files must be NODATACOW before any data is written.
+allocate_swapfile() {
+  local path=$1 fstype=$2 mode=${3:-auto}
+  rm -f "$path"
+  if [ "$fstype" = "btrfs" ]; then
+    : > "$path"
+    # +C only sticks on an empty file.
+    chattr +C "$path" || return 1
+  fi
+  if [ "$mode" != "dd" ] && fallocate -l "$swap_bytes" "$path" 2>/dev/null && ! file_has_holes "$path"; then
+    return 0
+  fi
+  log "writing $(bytes_human "$swap_bytes") swap file with dd"
+  rm -f "$path"
+  if [ "$fstype" = "btrfs" ]; then
+    : > "$path"
+    chattr +C "$path" || return 1
+  fi
+  dd if=/dev/zero of="$path" bs=1M count=$((swap_bytes / 1048576)) status=none conv=fsync
+}
+
+enable_swapfile() {
+  local fstype=$1 mode=$2
+  allocate_swapfile /swapfile "$fstype" "$mode" || return 1
+  chmod 0600 /swapfile || return 1
+  mkswap /swapfile >/dev/null || return 1
+  swapon /swapfile
+}
+
+install_swap_fstab() {
+  [ -f /etc/fstab ] || err "/etc/fstab is missing"
+  if grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab; then
+    return 0
+  fi
+  printf '/swapfile none swap sw 0 0\n' >>/etc/fstab || err "failed to update /etc/fstab"
+}
+
+set_swappiness() {
+  local conf=/etc/sysctl.d/99-swap.conf
+  install -d -m 0755 /etc/sysctl.d
+  cat >"$conf" <<'EOF'
+# managed by cloud-startup-script
+vm.swappiness=10
+EOF
+  chmod 0644 "$conf"
+  sysctl -q -p "$conf" >/dev/null || err "failed to apply vm.swappiness"
+}
+
+configure_swap() {
+  local fstype avail_kb need_kb existing_kb human
+  if [ "$swap_bytes" -eq 0 ]; then
+    log "swap skipped (SWAP_SIZE=$SWAP_SIZE)"
+    return 0
+  fi
+
+  human=$(bytes_human "$swap_bytes")
+
+  if [ -e /swapfile ] && [ ! -f /swapfile ]; then
+    err "/swapfile exists and is not a regular file"
+  fi
+
+  # Same size and already a swap signature: enable it, do not rewrite.
+  if [ -f /swapfile ] && [ "$(stat -c%s /swapfile)" -eq "$swap_bytes" ] && swapfile_is_swap; then
+    if swapfile_active || swapon /swapfile; then
+      install_swap_fstab
+      set_swappiness
+      log "swap already present: /swapfile ($human, swappiness 10)"
+      return 0
+    fi
+    log "existing /swapfile did not enable; recreating"
+  fi
+
+  avail_kb=$(df -Pk / | awk 'NR==2 {print $4}') || err "df / failed"
+  existing_kb=0
+  if [ -f /swapfile ]; then
+    existing_kb=$(( $(stat -c%s /swapfile) / 1024 ))
+  fi
+  # Leave 1 GiB for the package installs that follow this step.
+  need_kb=$((swap_bytes / 1024 + 1024 * 1024))
+  if [ $((avail_kb + existing_kb)) -lt "$need_kb" ]; then
+    err "not enough free space for ${human} swap on / (free $((avail_kb / 1024)) MiB, need $((need_kb / 1024)) MiB including 1 GiB reserve); set a smaller SWAP_SIZE or 0 to skip"
+  fi
+
+  if swapfile_active; then
+    log "replacing /swapfile ($human)"
+    swapoff /swapfile || err "swapoff /swapfile failed"
+  else
+    log "creating swap file /swapfile ($human)"
+  fi
+
+  fstype=$(findmnt -n -o FSTYPE -T /) || err "could not detect filesystem type of /"
+  if ! enable_swapfile "$fstype" auto; then
+    log "swap file was rejected; rewriting it with dd"
+    swapoff /swapfile 2>/dev/null || true
+    enable_swapfile "$fstype" dd || err "swapon /swapfile failed"
+  fi
+  install_swap_fstab
+  set_swappiness
+  log "swap on: /swapfile ($human, swappiness 10)"
+}
+
+configure_swap
+
+# 4. System update ----------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
 
 log "updating apt indexes"
@@ -263,7 +432,7 @@ apt-get "${APT_OPTS[@]}" -y upgrade
 log "installing prerequisites"
 apt-get "${APT_OPTS[@]}" -y install ca-certificates curl gnupg
 
-# 4. Create sudo user, migrate SSH keys -------------------------------------
+# 5. Create sudo user, migrate SSH keys -------------------------------------
 if id -u "$USERNAME" >/dev/null 2>&1; then
   log "user '$USERNAME' already exists; skipping creation"
 else
@@ -290,7 +459,7 @@ install -m 0600 -o "$USERNAME" -g "$USERNAME" /root/.ssh/authorized_keys "$home_
 grep -qE '^[^#[:space:]]' "$home_ssh/authorized_keys" \
   || err "no SSH keys present in $home_ssh/authorized_keys after copy"
 
-# 5. Docker + Compose plugin ------------------------------------------------
+# 6. Docker + Compose plugin ------------------------------------------------
 log "installing Docker (official apt repo)"
 install -d -m 0755 /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
@@ -307,7 +476,7 @@ apt-get "${APT_OPTS[@]}" -y install \
 usermod -aG docker "$USERNAME"
 systemctl enable --now docker
 
-# 6. Unattended security upgrades -------------------------------------------
+# 7. Unattended security upgrades -------------------------------------------
 log "enabling unattended-upgrades"
 apt-get "${APT_OPTS[@]}" -y install unattended-upgrades
 cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -315,7 +484,7 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
 
-# 7. Apply link DNS (before SSH lockdown) ------------------------------------
+# 8. Apply link DNS (before SSH lockdown) ------------------------------------
 # systemd-resolved already sends lookups to the pinned servers. Applying
 # netplan here clears DHCP resolvers on the interface. Deferred until the
 # package installs finish so a network restart cannot cut off `curl | bash`,
@@ -370,7 +539,7 @@ if [ "$netplan_dns_ready" -eq 1 ]; then
   log "link DNS pinned: $(resolvectl dns 2>/dev/null | tr '\n' ' ')"
 fi
 
-# 8. SSH hardening (LAST — leave root access intact if earlier steps fail) --
+# 9. SSH hardening (LAST — leave root access intact if earlier steps fail) --
 log "hardening sshd"
 # sshd keeps the first value of each keyword. Ubuntu's sshd_config starts with
 # `Include /etc/ssh/sshd_config.d/*.conf`, expanded in lexical order, so
@@ -428,10 +597,15 @@ else
   systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
 fi
 
-# 9. Done -------------------------------------------------------------------
+# 10. Done ------------------------------------------------------------------
 log "complete"
 log "  user:      $USERNAME (groups: sudo, docker)"
 log "  ssh port:  $SSH_PORT"
 log "  dns:       ${dns_list[*]}"
+if [ "$swap_bytes" -eq 0 ]; then
+  log "  swap:      disabled"
+else
+  log "  swap:      /swapfile ($(bytes_human "$swap_bytes"), swappiness 10)"
+fi
 log "  connect:   ssh -p $SSH_PORT $USERNAME@<host>"
 log "  root ssh:  disabled"

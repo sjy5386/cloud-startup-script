@@ -5,6 +5,7 @@ Automates the initial setup of a fresh Ubuntu LTS cloud instance:
 - Create a sudo user and migrate SSH keys from `/root/.ssh/authorized_keys`
 - Disable root SSH login and password authentication (public-key only)
 - Pin DNS to `1.1.1.1` and `1.0.0.1` (DHCP-provided resolvers are ignored)
+- Add a 2G swap file (`vm.swappiness=10`) before package installs
 - Install Docker Engine and the Docker Compose plugin
 - Enable `unattended-upgrades` for automatic security patches
 
@@ -13,8 +14,8 @@ Automates the initial setup of a fresh Ubuntu LTS cloud instance:
 Paste the contents of `bootstrap.sh` into your CSP's user-data field when
 creating the instance. That field is limited to 1024 bytes, so keep
 `bootstrap.sh` within that size. `.githooks/pre-commit` rejects a commit
-that exceeds it. Adjust `USERNAME`, `SSH_PORT`, or `DNS_SERVERS` at the
-top of the script if needed.
+that exceeds it. Adjust `USERNAME`, `SSH_PORT`, `DNS_SERVERS`, or
+`SWAP_SIZE` at the top of the script if needed.
 
 `bootstrap.sh` pins those resolvers before it installs `curl` or downloads
 `setup.sh`. `setup.sh` applies the same resolvers again and ignores DHCP DNS.
@@ -32,6 +33,7 @@ ssh ubuntu@<host>
 | `USERNAME`    | `ubuntu`          | Name of the sudo user to create                         |
 | `SSH_PORT`    | `22`              | sshd listen port (sync with your network firewall too)  |
 | `DNS_SERVERS` | `1.1.1.1 1.0.0.1` | Space-separated IPv4 resolvers. DHCP DNS is not used.  |
+| `SWAP_SIZE`   | `2G`              | Swap file size (`512M`, `2G`, `2GB`, or `0` to skip). Created at `/swapfile` before package installs. |
 
 ## Supported Ubuntu versions
 
@@ -55,6 +57,9 @@ https://raw.githubusercontent.com/sjy5386/cloud-startup-script/refs/tags/v1.0.0/
 ## Troubleshooting
 
 - DNS in use: `resolvectl dns` (expect only `1.1.1.1` and `1.0.0.1`)
+- Swap: `swapon --show` (expect `/swapfile`). `SWAP_SIZE=0` skips it.
+  Creation fails before packages are installed when `/` does not have the
+  swap size plus 1 GiB free.
 - If setup stops at `name resolution failed`, the instance cannot reach the
   pinned resolvers on port 53.
 - Execution log: `/var/log/cloud-init-output.log`

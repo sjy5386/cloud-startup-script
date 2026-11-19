@@ -57,14 +57,35 @@ https://raw.githubusercontent.com/sjy5386/cloud-startup-script/refs/tags/v1.0.0/
 ## Troubleshooting
 
 - DNS in use: `resolvectl dns` (expect only `1.1.1.1` and `1.0.0.1`)
+- Existing static DNS addresses are removed from the supported Netplan
+  interfaces before the managed override is added. The merged settings are
+  checked before package installs. Files containing static DNS are rewritten;
+  other settings, ownership, and permissions are preserved, but YAML comments
+  and formatting may change. On write, validation, or apply failure, the
+  original Netplan files are restored and the backup path is logged.
 - Swap: `swapon --show` (expect `/swapfile`). `SWAP_SIZE=0` skips it.
   Creation fails before packages are installed when `/` does not have the
   swap size plus 1 GiB free.
 - If setup stops at `name resolution failed`, the instance cannot reach the
   pinned resolvers on port 53.
 - Execution log: `/var/log/cloud-init-output.log`
+- An active SSH service must reload successfully before setup reports success.
+  An inactive service is accepted only when `ssh.socket` is active, so the next
+  connection starts sshd with the validated configuration. Failed or
+  transitional service states stop setup.
 - SSH hardening is the last step, so a failure earlier in the script leaves
   existing root SSH access intact.
 - Setting `SSH_PORT` to anything other than `22` disables Ubuntu 22.10+'s
   socket-activated `ssh.socket` and switches to the regular `ssh.service`
   so the `Port` directive takes effect.
+
+Run the regression tests in a disposable Ubuntu 26.04 container:
+
+```bash
+docker build -t cloud-startup-tests -f tests/Dockerfile .
+docker run --rm --network none -v "$PWD:/review:ro" cloud-startup-tests
+```
+
+Tests use real Netplan merging and generation, with simulated daemon reloads,
+service states, and apply failures. They do not exercise live systemd, DHCP,
+or RA traffic.

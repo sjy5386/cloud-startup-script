@@ -129,22 +129,57 @@ if [ ! -L /etc/resolv.conf ]; then
   ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 fi
 
-# 1 = /etc/netplan/99-dns.yaml was written and `netplan generate` accepted it.
+# 1 = the DNS configuration passed generation and merged-settings validation.
 # `netplan apply` is deferred until package installs finish.
 netplan_dns_ready=0
+netplan_backup_dir=""
+
+restore_netplan_dns() {
+  [ -n "$netplan_backup_dir" ] || return 1
+  # The override may be new, or may replace one from an earlier run.
+  rm -f /etc/netplan/99-dns.yaml || return 1
+  cp -a "$netplan_backup_dir/netplan/." /etc/netplan/ || return 1
+  netplan generate
+}
+
+merged_netplan_dns_is_exact() {
+  local dns_csv
+  dns_csv=$(IFS=,; printf '%s' "${dns_list[*]}")
+  python3 - "$dns_csv" <<'PY'
+import subprocess, sys, yaml
+
+result = subprocess.run(["netplan", "get"], check=True, capture_output=True, text=True)
+network = (yaml.safe_load(result.stdout) or {}).get("network", {})
+want = set(sys.argv[1].split(","))
+checked = False
+for kind in ("ethernets", "bonds", "bridges", "vlans"):
+    for name, cfg in (network.get(kind) or {}).items():
+        got = set((cfg.get("nameservers") or {}).get("addresses") or [])
+        if got != want:
+            print(f"netplan DNS mismatch for {kind}.{name}: {sorted(got)}", file=sys.stderr)
+            sys.exit(1)
+        checked = True
+sys.exit(0 if checked else 1)
+PY
+}
 
 pin_dns_via_netplan() {
   command -v python3 >/dev/null || { log "python3 missing; skipping netplan DNS override"; return 0; }
   command -v netplan >/dev/null || { log "netplan missing; skipping netplan DNS override"; return 0; }
+  [ -d /etc/netplan ] || { log "no /etc/netplan directory; skipping netplan DNS override"; return 0; }
 
   local dns_csv netplan_rc netplan_ifaces
   netplan_rc=0
   netplan_ifaces=""
   dns_csv=$(IFS=,; printf '%s' "${dns_list[*]}")
+  netplan_backup_dir=$(mktemp -d /var/tmp/cloud-startup-netplan.XXXXXX) \
+    || err "failed to create netplan backup directory"
+  cp -a /etc/netplan "$netplan_backup_dir/netplan" \
+    || err "failed to back up /etc/netplan to $netplan_backup_dir"
   # python exits 2 when PyYAML is missing, 3 when no netplan devices exist.
   # The heredoc terminator must be at column 0.
   netplan_ifaces=$(python3 - "$dns_csv" <<'PY'
-import glob, os, sys
+import glob, os, stat, sys, tempfile
 
 try:
     import yaml
@@ -159,6 +194,7 @@ if not servers:
 # fragment that enables DHCP is not missed.
 found = {}
 order = []
+changed = {}
 paths = sorted(glob.glob("/etc/netplan/*.yaml")) + sorted(glob.glob("/etc/netplan/*.yml"))
 for path in paths:
     if os.path.basename(path) == "99-dns.yaml":
@@ -173,6 +209,7 @@ for path in paths:
     network = data.get("network") or {}
     if not isinstance(network, dict):
         continue
+    dirty = False
     for kind in ("ethernets", "bonds", "bridges", "vlans"):
         block = network.get(kind) or {}
         if not isinstance(block, dict):
@@ -187,6 +224,16 @@ for path in paths:
             ]
             if key not in order:
                 order.append(key)
+            # Netplan concatenates address sequences across files. Remove
+            # static DNS here so the managed override supplies the only list.
+            nameservers = cfg.get("nameservers")
+            if isinstance(nameservers, dict) and "addresses" in nameservers:
+                cfg["nameservers"] = {k: v for k, v in nameservers.items() if k != "addresses"}
+                if not cfg["nameservers"]:
+                    del cfg["nameservers"]
+                dirty = True
+    if dirty:
+        changed[path] = data
 
 if not order:
     sys.exit(3)
@@ -194,6 +241,24 @@ if not order:
 class _NoAliasDumper(yaml.SafeDumper):
     def ignore_aliases(self, data):
         return True
+
+def write_yaml(path, data, managed=False):
+    fd, temp = tempfile.mkstemp(prefix=".cloud-startup-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            if managed:
+                fh.write("# managed by cloud-startup-script\n")
+            yaml.dump(data, fh, Dumper=_NoAliasDumper, sort_keys=False, default_flow_style=False)
+        if managed:
+            os.chmod(temp, 0o600)
+        else:
+            original = os.stat(path)
+            os.chown(temp, original.st_uid, original.st_gid)
+            os.chmod(temp, stat.S_IMODE(original.st_mode))
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
 
 network_out = {"version": 2}
 for kind, name in order:
@@ -208,17 +273,9 @@ for kind, name in order:
         entry["dhcp6-overrides"] = {"use-dns": False}
     network_out.setdefault(kind, {})[name] = entry
 
-path = "/etc/netplan/99-dns.yaml"
-with open(path, "w", encoding="utf-8") as fh:
-    fh.write("# managed by cloud-startup-script\n")
-    yaml.dump(
-        {"network": network_out},
-        fh,
-        Dumper=_NoAliasDumper,
-        sort_keys=False,
-        default_flow_style=False,
-    )
-os.chmod(path, 0o600)
+for path, data in changed.items():
+    write_yaml(path, data)
+write_yaml("/etc/netplan/99-dns.yaml", {"network": network_out}, managed=True)
 print(" ".join(f"{kind}.{name}" for kind, name in order))
 PY
 ) && netplan_rc=0 || netplan_rc=$?
@@ -226,27 +283,31 @@ PY
   case "$netplan_rc" in
     0) ;;
     2)
+      rm -rf "$netplan_backup_dir"
+      netplan_backup_dir=""
       log "python3-yaml missing; DHCP DNS is not disabled (systemd-resolved still pins global DNS)"
       return 0
       ;;
     3)
+      rm -rf "$netplan_backup_dir"
+      netplan_backup_dir=""
       log "no netplan interfaces found; DHCP DNS is not disabled (systemd-resolved still pins global DNS)"
       return 0
       ;;
     *)
-      err "failed to write /etc/netplan/99-dns.yaml (python exit $netplan_rc)"
+      restore_netplan_dns \
+        || err "netplan write failed and rollback failed; backup: $netplan_backup_dir"
+      err "netplan write failed (python exit $netplan_rc); restored original files; backup: $netplan_backup_dir"
       ;;
   esac
 
-  log "netplan DNS override for: $netplan_ifaces"
+  log "netplan DNS override for: $netplan_ifaces (backup: $netplan_backup_dir)"
   # generate only renders backend files under /run. It does not restart the
   # network, so the curl|bash pipe stays up. apply happens later.
-  if ! netplan generate; then
-    rm -f /etc/netplan/99-dns.yaml
-    if netplan generate >/dev/null 2>&1; then
-      err "netplan generate rejected the DNS override; removed /etc/netplan/99-dns.yaml"
-    fi
-    err "netplan generate failed even without the DNS override"
+  if ! netplan generate || ! merged_netplan_dns_is_exact; then
+    restore_netplan_dns \
+      || err "netplan validation failed and rollback failed; backup: $netplan_backup_dir"
+    err "netplan DNS validation failed; restored original files; backup: $netplan_backup_dir"
   fi
   netplan_dns_ready=1
 }
@@ -517,10 +578,10 @@ apply_pinned_dns() {
   [ "$netplan_dns_ready" -eq 1 ] || return 0
   log "applying netplan DNS override"
   if ! netplan apply; then
-    rm -f /etc/netplan/99-dns.yaml
-    netplan generate >/dev/null 2>&1 || true
+    restore_netplan_dns \
+      || err "netplan apply failed and config rollback failed; backup: $netplan_backup_dir"
     netplan apply || err "netplan apply failed and rollback failed"
-    err "netplan apply failed; rolled back the DNS override"
+    err "netplan apply failed; restored original files; backup: $netplan_backup_dir"
   fi
   systemctl restart systemd-resolved
 }
@@ -556,12 +617,22 @@ dns_is_exact() {
   done
 }
 
-apply_pinned_dns
-if [ "$netplan_dns_ready" -eq 1 ]; then
-  retry dns_is_exact \
-    || err "DHCP DNS is still installed (want only: ${dns_list[*]}; resolvectl dns: $(resolvectl dns 2>/dev/null | tr '\n' ' '))"
+verify_pinned_dns() {
+  [ "$netplan_dns_ready" -eq 1 ] || return 0
+  if ! retry dns_is_exact; then
+    log "unexpected DNS after netplan apply: $(resolvectl dns 2>/dev/null | tr '\n' ' ')"
+    restore_netplan_dns \
+      || err "DNS verification failed and config rollback failed; backup: $netplan_backup_dir"
+    netplan apply || err "DNS verification failed and rollback failed; backup: $netplan_backup_dir"
+    err "DNS verification failed (want only: ${dns_list[*]}); restored original files; backup: $netplan_backup_dir"
+  fi
   log "link DNS pinned: $(resolvectl dns 2>/dev/null | tr '\n' ' ')"
-fi
+  rm -rf "$netplan_backup_dir"
+  netplan_backup_dir=""
+}
+
+apply_pinned_dns
+verify_pinned_dns
 
 # 9. SSH hardening (LAST — leave root access intact if earlier steps fail) --
 log "hardening sshd"
@@ -608,18 +679,36 @@ if [ -n "$fail" ]; then
 fi
 rm -f /etc/ssh/sshd_config.d/99-hardening.conf
 
-if [ "$SSH_PORT" != "22" ]; then
-  # Ubuntu 22.10+ ships socket-activated ssh.socket bound to 22 — disable it
-  # so the Port directive in sshd_config takes effect on ssh.service.
-  if systemctl is-enabled ssh.socket >/dev/null 2>&1; then
-    log "disabling socket-activated ssh.socket to honor custom port"
-    systemctl disable --now ssh.socket
+apply_ssh_hardening() {
+  local service_state
+  if [ "$SSH_PORT" != "22" ]; then
+    # Ubuntu 22.10+ ships socket-activated ssh.socket bound to 22 — disable it
+    # so the Port directive in sshd_config takes effect on ssh.service.
+    if systemctl is-enabled ssh.socket >/dev/null 2>&1; then
+      log "disabling socket-activated ssh.socket to honor custom port"
+      systemctl disable --now ssh.socket
+    fi
+    systemctl enable --now ssh.service
+    systemctl restart ssh.service
+  else
+    service_state=$(systemctl show --property=ActiveState --value ssh.service) \
+      || err "could not read ssh.service state"
+    case "$service_state" in
+      active)
+        systemctl reload ssh.service || err "failed to reload ssh.service"
+        systemctl is-active --quiet ssh.service || err "ssh.service is not active after reload"
+        ;;
+      inactive)
+        systemctl is-active --quiet ssh.socket \
+          || err "ssh.service is inactive and ssh.socket is not active"
+        log "ssh.socket is active; sshd will read the validated config on activation"
+        ;;
+      *) err "ssh.service is $service_state; hardening application could not be confirmed" ;;
+    esac
   fi
-  systemctl enable --now ssh.service
-  systemctl restart ssh.service
-else
-  systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-fi
+}
+
+apply_ssh_hardening
 
 # 10. Done ------------------------------------------------------------------
 log "complete"
